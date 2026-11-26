@@ -1,0 +1,70 @@
+name: Unlock scope key
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: "Scope to unlock (e.g. screen-history/2026-11-25)"
+        required: true
+        type: string
+      pubkey:
+        description: "Ephemeral age public key (age1...)"
+        required: true
+        type: string
+
+jobs:
+  unlock:
+    runs-on: ubuntu-latest
+    environment: unlock
+    steps:
+      - name: Install age
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq age
+
+      - name: Derive and wrap scope key
+        env:
+          MASTER_KEY: ${{ secrets.MASTER_KEY }}
+          SCOPE: ${{ inputs.scope }}
+          PUBKEY: ${{ inputs.pubkey }}
+        run: |
+          python3 - "$MASTER_KEY" "$SCOPE" <<'PY' | age -a -r "$PUBKEY" -o scope.key.age
+          import sys, hmac, hashlib
+          CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+          def polymod(values):
+              gen = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
+              chk = 1
+              for v in values:
+                  b = chk >> 25
+                  chk = ((chk & 0x1ffffff) << 5) ^ v
+                  for i in range(5):
+                      chk ^= gen[i] if ((b >> i) & 1) else 0
+              return chk
+          def hrp_expand(hrp):
+              return [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
+          def convertbits(data, frombits, tobits):
+              acc, bits, ret, maxv = 0, 0, [], (1 << tobits) - 1
+              for v in data:
+                  acc = (acc << frombits) | v
+                  bits += frombits
+                  while bits >= tobits:
+                      bits -= tobits
+                      ret.append((acc >> bits) & maxv)
+              if bits:
+                  ret.append((acc << (tobits - bits)) & maxv)
+              return ret
+          def bech32_encode(hrp, data):
+              values = hrp_expand(hrp) + data
+              pm = polymod(values + [0]*6) ^ 1
+              chk = [(pm >> 5 * (5 - i)) & 31 for i in range(6)]
+              return hrp + "1" + "".join(CHARSET[d] for d in data + chk)
+
+          raw = hmac.new(sys.argv[1].encode("utf-8"), sys.argv[2].encode("utf-8"), hashlib.sha256).digest()
+          print(bech32_encode("age-secret-key-", convertbits(raw, 8, 5)).upper())
+          PY
+          echo "::notice title=scope-key::$(base64 -w0 scope.key.age)"
+
+      - name: Upload wrapped scope key
+        uses: actions/upload-artifact@v4
+        with:
+          name: scope-key
+          path: scope.key.age
+          retention-days: 1
