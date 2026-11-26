@@ -1,10 +1,17 @@
 name: Unlock scope key
 
 on:
+  issues:
+    types: [opened]
   workflow_dispatch:
     inputs:
       scope:
-        description: "Scope to unlock (e.g. screen-history/2026-11-25)"
+        description: "Scope to unlock (default: screen-history)"
+        required: true
+        default: "screen-history"
+        type: string
+      id:
+        description: "Response branch ID (res/<id>)"
         required: true
         type: string
       pubkey:
@@ -12,20 +19,57 @@ on:
         required: true
         type: string
 
+permissions:
+  contents: write
+  issues: write
+
 jobs:
   unlock:
+    if: github.event_name == 'workflow_dispatch' || github.event.issue.user.login == 'tetratorus'
     runs-on: ubuntu-latest
     environment: unlock
     steps:
       - name: Install age
         run: sudo apt-get update -qq && sudo apt-get install -y -qq age
 
-      - name: Derive and wrap scope key
+      - name: Derive, wrap, and publish to res/<id>
         env:
           MASTER_KEY: ${{ secrets.MASTER_KEY }}
-          SCOPE: ${{ inputs.scope }}
-          PUBKEY: ${{ inputs.pubkey }}
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          ISSUE_NUM: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          IN_SCOPE: ${{ inputs.scope }}
+          IN_ID: ${{ inputs.id }}
+          IN_PUBKEY: ${{ inputs.pubkey }}
         run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "issues" ]]; then
+            # Title format: "unlock-<id>" (defaults scope=screen-history) or "<scope>:<id>"
+            if [[ "$ISSUE_TITLE" == *:* ]]; then
+              SCOPE="${ISSUE_TITLE%%:*}"
+              REQ_ID="${ISSUE_TITLE#*:}"
+            else
+              SCOPE="screen-history"
+              REQ_ID="${ISSUE_TITLE#unlock-}"
+            fi
+            PUBKEY="$(printf '%s' "$ISSUE_BODY" | tr -d '[:space:]')"
+          else
+            SCOPE="$IN_SCOPE"
+            REQ_ID="$IN_ID"
+            PUBKEY="$(printf '%s' "$IN_PUBKEY" | tr -d '[:space:]')"
+          fi
+
+          if [[ ! "$PUBKEY" =~ ^age1[a-z0-9]{50,}$ ]]; then
+            echo "Invalid age pubkey" >&2
+            exit 1
+          fi
+          if [[ ! "$REQ_ID" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+            echo "Invalid request id" >&2
+            exit 1
+          fi
+
           python3 - "$MASTER_KEY" "$SCOPE" <<'PY' | age -a -r "$PUBKEY" -o scope.key.age
           import sys, hmac, hashlib
           CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
@@ -60,11 +104,17 @@ jobs:
           raw = hmac.new(sys.argv[1].encode("utf-8"), sys.argv[2].encode("utf-8"), hashlib.sha256).digest()
           print(bech32_encode("age-secret-key-", convertbits(raw, 8, 5)).upper())
           PY
-          echo "::notice title=scope-key::$(base64 -w0 scope.key.age)"
 
-      - name: Upload wrapped scope key
-        uses: actions/upload-artifact@v4
-        with:
-          name: scope-key
-          path: scope.key.age
-          retention-days: 1
+          mkdir -p out && mv scope.key.age out/scope.key.age
+          cd out
+          git init -b "res/$REQ_ID"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add scope.key.age
+          git commit -m "res"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --force origin "HEAD:refs/heads/res/$REQ_ID"
+
+          if [[ "$EVENT_NAME" == "issues" && -n "$ISSUE_NUM" ]]; then
+            gh issue close "$ISSUE_NUM" --repo "$GITHUB_REPOSITORY" >/dev/null || true
+          fi
